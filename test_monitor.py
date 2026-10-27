@@ -38,6 +38,7 @@ def fake_get(url, params=None, timeout=None):
     if url.endswith("/services"):
         return Resp(200, {"data": [{"id": m.SERVICE_ID, "attributes": {"name": "Изготовление паспорта (загран)"}}]})
     assert params["filter[serviceId]"] == m.SERVICE_ID
+    API["calls"] = API.get("calls", 0) + 1
     return Resp(200, {"data": API["slots"]})
 
 
@@ -185,6 +186,59 @@ m.run_once(report_to=["111"])
 parts = [s for s in SENT if s["chat_id"] == "111"]
 assert len(parts) >= 2 and "reply_markup" in parts[-1] and all("reply_markup" not in p for p in parts[:-1])
 print(f"10 OK длинный список: {len(parts)} части")
+
+# 12. Кнопка «Ближайшая запись»: самое раннее будущее окно, остальные времена дня, другие сотрудники
+reset()
+past = {"type": "timeSlot", "attributes": {"start": "2026-10-01T08:00:00+03:00"},
+        "relationships": {"resource": {"data": {"id": R2}}}}
+API["slots"] = [slot(R1, "17", "08:00"), slot(R1, "17", "08:15"), slot(R1, "17", "08:30"),
+                slot(R2, "18", "09:00"), slot(R2, "19", "10:00"), past]
+m.run_once(); reset()
+UPDATES[:] = [{"update_id": 700, "message": {"chat": {"id": 111, "type": "private"}, "text": m.BTN_NEAREST}}]
+assert m.poll_telegram(5) is True
+msgs = [s for s in SENT if s["chat_id"] == "111"]
+assert len(msgs) == 1, texts()
+t = msgs[0]["text"]
+assert "Ближайшая запись: вт 17.11 в 08:00</b> (через " in t, t
+assert "👤 Владимир Руснак" in t and "Ещё в этот день: 08:15 08:30" in t
+assert "Дойна &lt;Гайтур&gt; — ср 18.11 в 09:00" in t and "10:00" not in t and "01.10" not in t
+assert msgs[0]["reply_markup"] == m.NEAREST_KEYBOARD
+print("12 OK ближайшая:\n" + t)
+
+# 13. «Ближайшая» (inline) и «Проверить» в одной пачке — одна проверка сайта, каждому свой ответ
+reset(); calls0 = API.get("calls", 0)
+UPDATES[:] = [
+    {"update_id": 701, "callback_query": {"id": "cb2", "data": "nearest", "message": {"chat": {"id": 222}}}},
+    {"update_id": 702, "message": {"chat": {"id": 111, "type": "private"}, "text": "/check"}},
+    {"update_id": 703, "message": {"chat": {"id": 111, "type": "private"}, "text": "/nearest@my_bot"}},
+]
+assert m.poll_telegram(5) is True
+assert API["calls"] - calls0 == 1
+by = {}
+for cid, tx in texts():
+    by.setdefault(cid, []).append(tx)
+assert [x[:1] for x in by["222"]] == ["⏰"] and sorted(x[:1] for x in by["111"]) == ["⏰", "🔍"], by
+print("13 OK одна проверка на обе кнопки")
+
+# 14. Новое окно раньше всех — в уведомлении пометка «это теперь ближайшая»
+reset(); API["slots"].append(slot(R2, "16", "12:00")); m.run_once()
+assert len(SENT) == 2 and "Это теперь ближайшая запись: пн 16.11 в 12:00" in SENT[0]["text"], texts()
+reset(); API["slots"].append(slot(R2, "20", "12:00")); m.run_once()
+assert len(SENT) == 2 and "ближайшая" not in SENT[0]["text"]
+print("14 OK пометка ближайшей в уведомлении")
+
+# 15. Кнопки от старой версии — бот один раз присылает новую клавиатуру
+reset(); m.STATE["kb"] = 1; m.run_once()
+assert len(SENT) == 2 and all("Обновил кнопки" in s["text"] and s["reply_markup"] == m.MAIN_KEYBOARD
+                              for s in SENT), texts()
+reset(); m.run_once(); assert SENT == [] and m.STATE["kb"] == m.KB_VERSION
+print("15 OK обновление клавиатуры")
+
+# 16. Окон нет совсем
+reset(); m.STATE["slots"] = []; API["slots"] = []
+m.run_once(nearest_to=["111"])
+assert len(SENT) == 1 and "Свободных окон сейчас нет" in SENT[0]["text"]
+print("16 OK ближайшая при пустом списке")
 
 # 11. Цикл --for: проверки идут, кнопки обрабатываются, в конце подтверждается offset
 reset(); UPDATES[:] = []

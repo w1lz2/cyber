@@ -7,6 +7,7 @@
   • новые дни, которые открываются для записи.
 
 Кнопки бота в Telegram:
+  ⏰ Ближайшая запись — свежая проверка и самое раннее свободное окно;
   🔍 Проверить сейчас — свежая проверка и все свободные окна прямо сейчас;
   ℹ️ Статус          — работает ли мониторинг и когда была последняя проверка.
 
@@ -74,14 +75,21 @@ TG_ENABLED = bool(TG_TOKEN and TG_CHAT_IDS)
 IN_GITHUB = os.getenv("GITHUB_ACTIONS") == "true"
 tg_session = requests.Session()
 
+BTN_NEAREST = "⏰ Ближайшая запись"
 BTN_CHECK = "🔍 Проверить сейчас"
 BTN_STATUS = "ℹ️ Статус"
+BUTTONS_HELP = (f"{BTN_NEAREST} — самое раннее свободное окно\n"
+                f"{BTN_CHECK} — все свободные окна прямо сейчас\n"
+                f"{BTN_STATUS} — работает ли мониторинг")
 # Постоянные кнопки под полем ввода сообщения
-MAIN_KEYBOARD = {"keyboard": [[{"text": BTN_CHECK}, {"text": BTN_STATUS}]],
+MAIN_KEYBOARD = {"keyboard": [[{"text": BTN_NEAREST}], [{"text": BTN_CHECK}, {"text": BTN_STATUS}]],
                  "resize_keyboard": True, "is_persistent": True}
+# Увеличить при изменении MAIN_KEYBOARD — бот сам пришлёт пользователям новые кнопки
+KB_VERSION = 2
 # Кнопки под сообщениями
 BOOK_BUTTON = {"text": "📝 Записаться", "url": BOOKING_URL}
 CHECK_KEYBOARD = {"inline_keyboard": [[{"text": "🔄 Обновить", "callback_data": "check"}, BOOK_BUTTON]]}
+NEAREST_KEYBOARD = {"inline_keyboard": [[{"text": "🔄 Обновить", "callback_data": "nearest"}, BOOK_BUTTON]]}
 NEW_KEYBOARD = {"inline_keyboard": [[{"text": "🔍 Все окна", "callback_data": "check"}, BOOK_BUTTON]]}
 
 STATE = {}  # state.json: уже виденные слоты, счётчик ошибок, позиция в очереди сообщений Telegram
@@ -152,18 +160,21 @@ def send(text, chat_ids=None, markup=None):
 
 
 def parse_update(u):
-    """(chat_id, команда) из обновления Telegram; команда: check / status / help. None — пропустить."""
+    """(chat_id, команда) из обновления Telegram; команда: nearest / check / status / help.
+    None — пропустить."""
     if "callback_query" in u:  # кнопка под сообщением
         q = u["callback_query"]
         tg("answerCallbackQuery", callback_query_id=q["id"], text="Проверяю…")
         chat = (q.get("message") or {}).get("chat") or {}
-        cmd = q.get("data") if q.get("data") in ("check", "status") else None
+        cmd = q.get("data") if q.get("data") in ("nearest", "check", "status") else None
     else:
         m = u.get("message") or {}
         chat = m.get("chat") or {}
         text = (m.get("text") or "").strip().lower()
         word = text.split()[0].split("@")[0] if text else ""
-        if word == "/check" or "провер" in text:
+        if word == "/nearest" or "ближайш" in text:
+            cmd = "nearest"
+        elif word == "/check" or "провер" in text:
             cmd = "check"
         elif word == "/status" or "статус" in text:
             cmd = "status"
@@ -213,12 +224,14 @@ def poll_telegram(wait):
     todo = list(dict.fromkeys(p for p in map(parse_update, updates) if p))
     for chat, cmd in todo:
         if cmd == "status":
-            send(status_text(), [chat])
+            send(status_text(), [chat], MAIN_KEYBOARD)
         elif cmd == "help":
             send(help_text(), [chat], MAIN_KEYBOARD)
+    # «Ближайшая» и «Проверить» в одной пачке — одна проверка сайта на всех
     check_chats = [chat for chat, cmd in todo if cmd == "check"]
-    if check_chats:
-        run_once(report_to=check_chats)
+    nearest_chats = [chat for chat, cmd in todo if cmd == "nearest"]
+    if check_chats or nearest_chats:
+        run_once(report_to=check_chats, nearest_to=nearest_chats)
         return True
     return False
 
@@ -268,7 +281,8 @@ def get_names():
 
 def get_free_slots(staff_names):
     """Множество строк 'Имя|YYYY-MM-DDTHH:MM' со всеми свободными окнами."""
-    today = datetime.now(TZ).date()
+    now = datetime.now(TZ)
+    today = now.date()
     data = api_get("/availability/booking-slots", {
         "filter[from]": today.isoformat(),
         "filter[to]": (today + timedelta(days=DAYS_AHEAD)).isoformat(),
@@ -285,6 +299,8 @@ def get_free_slots(staff_names):
         if STAFF_FILTER and name.lower() not in STAFF_FILTER:
             continue
         dt = datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone(TZ)
+        if dt <= now:  # уже прошло
+            continue
         slots.add(f"{name}|{dt:%Y-%m-%dT%H:%M}")
     return slots
 
@@ -355,6 +371,50 @@ def fmt_full(keys, new):
     return "\n".join(lines)
 
 
+def slot_time(key):
+    return datetime.strptime(key.split("|", 1)[1], "%Y-%m-%dT%H:%M").replace(tzinfo=TZ)
+
+
+def upcoming(keys):
+    """Ещё не прошедшие слоты, от самого раннего."""
+    now = datetime.now(TZ)
+    return sorted((k for k in keys if slot_time(k) > now), key=lambda k: k.split("|", 1)[1])
+
+
+def when(key):
+    d, t = key.split("|", 1)[1].split("T")
+    return f"{day_label(d)} в {t}"
+
+
+def in_days(key):
+    n = (slot_time(key).date() - datetime.now(TZ).date()).days
+    if n <= 1:
+        return "сегодня" if n <= 0 else "завтра"
+    return f"через {n} {plural(n, 'день', 'дня', 'дней')}"
+
+
+def fmt_nearest(keys):
+    """Самое раннее свободное окно + остальные времена в тот же день + ближайшее у других сотрудников."""
+    up = upcoming(keys)
+    if not up:
+        return "⏰ Свободных окон сейчас нет. Как только появятся — сразу напишу."
+    first = up[0]
+    name, ts = first.split("|", 1)
+    lines = [f"⏰ <b>Ближайшая запись: {when(first)}</b> ({in_days(first)})", f"👤 {esc(name)}"]
+    same_day = [k.split("T")[1] for k in up[1:] if k.startswith(f"{name}|{ts[:10]}T")]
+    if same_day:
+        more = f" и ещё {len(same_day) - 12}" if len(same_day) > 12 else ""
+        lines.append(f"Ещё в этот день: {' '.join(same_day[:12])}{more}")
+    others = {}
+    for k in up:
+        others.setdefault(k.split("|", 1)[0], k)
+    others.pop(name)
+    if others:
+        lines += ["", "Ближайшее у других сотрудников:"]
+        lines += [f"👤 {esc(n)} — {when(k)}" for n, k in others.items()]
+    return "\n".join(lines)
+
+
 def ago(iso):
     try:
         t = datetime.fromisoformat(iso).astimezone(TZ)
@@ -374,8 +434,7 @@ def help_text():
     return (f"👋 Слежу за свободными окнами записи в посольство Молдовы "
             f"(<b>{esc(service_name())}</b>) и сразу пишу сюда, когда появляются новые: "
             f"после чьей-то отмены или когда открывается новый день.\n\n"
-            f"{BTN_CHECK} — все свободные окна прямо сейчас\n"
-            f"{BTN_STATUS} — работает ли мониторинг")
+            f"{BUTTONS_HELP}")
 
 
 def status_text():
@@ -404,13 +463,22 @@ def status_text():
 
 # ---------------------- Проверка ----------------------
 
-def run_once(report_to=None):
-    """Одна проверка сайта. report_to — чаты, где нажали «Проверить сейчас»: им уходит полный список.
-    Возвращает True, если сайт ответил."""
+def run_once(report_to=None, nearest_to=None):
+    """Одна проверка сайта. Возвращает True, если сайт ответил.
+    report_to  — чаты, где нажали «Проверить сейчас»: им уходит полный список;
+    nearest_to — чаты, где нажали «Ближайшая запись»: им уходит самое раннее окно."""
     RUNTIME["checks"] += 1
     RUNTIME["last_try"] = time.monotonic()
     first_run = "slots" not in STATE
     prev = set(STATE.get("slots", []))
+
+    def reply(text):
+        """Ответ тем, кто нажал кнопку (у каждой кнопки своё «Обновить»)."""
+        if report_to:
+            send(text, report_to, CHECK_KEYBOARD)
+        if nearest_to:
+            send(text, nearest_to, NEAREST_KEYBOARD)
+
     try:
         staff_names, services = get_names()
         RUNTIME["service_name"] = services.get(SERVICE_ID, SERVICE_ID)
@@ -422,9 +490,8 @@ def run_once(report_to=None):
         traceback.print_exc()
         fails = STATE["fails"] = STATE.get("fails", 0) + 1
         RUNTIME["last_error"] = redact(e)
-        if report_to:
-            send(f"⚠️ Сайт записи сейчас не отвечает, попробуйте через минуту.\n"
-                 f"<i>{esc(RUNTIME['last_error'][:300])}</i>", report_to, CHECK_KEYBOARD)
+        reply(f"⚠️ Сайт записи сейчас не отвечает, попробуйте через минуту.\n"
+              f"<i>{esc(RUNTIME['last_error'][:300])}</i>")
         if fails == 3 or fails % 100 == 0:
             send(f"⚠️ Мониторинг записи: сайт не отвечает "
                  f"({fails} {plural(fails, 'ошибка', 'ошибки', 'ошибок')} подряд).\n"
@@ -440,36 +507,40 @@ def run_once(report_to=None):
         STATE["empty_count"] = empty + 1
         save_state()
         log(f"Сайт вернул 0 окон, хотя было {len(prev)}, — похоже на сбой, перепроверю.")
-        if report_to:
-            send(f"🔍 Сайт сейчас показывает 0 свободных окон, хотя при прошлой проверке было "
-                 f"{len(prev)}. Похоже на сбой сайта — перепроверю через минуту.",
-                 report_to, CHECK_KEYBOARD)
+        reply(f"🔍 Сайт сейчас показывает 0 свободных окон, хотя при прошлой проверке было "
+              f"{len(prev)}. Похоже на сбой сайта — перепроверю через минуту.")
         return True
 
     new = current - prev
     was_alerted = STATE.get("alerted")
-    STATE.update(slots=sorted(current), fails=0, empty_count=0, alerted=False,
+    old_keyboard = not first_run and STATE.get("kb") != KB_VERSION
+    STATE.update(slots=sorted(current), fails=0, empty_count=0, alerted=False, kb=KB_VERSION,
                  last_ok=datetime.now(TZ).isoformat(timespec="seconds"))
     log(f"{service_name()}: свободно {len(current)}, новых {len(new)}")
+    checked = f"<i>проверено {datetime.now(TZ):%d.%m %H:%M} МСК</i>"
 
     if was_alerted:
         send("✅ Сайт записи снова отвечает, мониторинг продолжается.")
+    if old_keyboard:  # у пользователя кнопки от прошлой версии — присылаем новые
+        send(f"⌨️ Обновил кнопки внизу:\n{BUTTONS_HELP}", markup=MAIN_KEYBOARD)
     if first_run:
         msg = f"✅ <b>Мониторинг запущен</b>: {esc(service_name())}\nСейчас свободно: {len(current)}\n"
         if current:
             msg += "\n" + fmt_summary(current) + "\n"
-        msg += (f"\nДальше буду присылать только новые окна.\n"
-                f"Кнопка «{BTN_CHECK}» внизу — все свободные окна в любой момент.")
+        msg += f"\nДальше буду присылать только новые окна.\n\nКнопки внизу:\n{BUTTONS_HELP}"
         send(msg, markup=MAIN_KEYBOARD)
     elif new:
         others = [c for c in TG_CHAT_IDS if c not in (report_to or [])]
         if others:
-            send(f"🟢 <b>Новые свободные окна ({len(new)})</b> — {esc(service_name())}\n\n"
-                 f"{fmt_new(new, prev)}", others, NEW_KEYBOARD)
+            msg = (f"🟢 <b>Новые свободные окна ({len(new)})</b> — {esc(service_name())}\n\n"
+                   f"{fmt_new(new, prev)}")
+            up = upcoming(current)
+            if up and up[0] in new:
+                msg += f"\n\n⏰ <b>Это теперь ближайшая запись: {when(up[0])}</b>"
+            send(msg, others, NEW_KEYBOARD)
     if report_to:
         marked = set() if first_run else new
-        msg = (f"🔍 <b>Свободно сейчас: {okon(len(current))}</b> — {esc(service_name())}\n"
-               f"<i>проверено {datetime.now(TZ):%d.%m %H:%M} МСК</i>")
+        msg = f"🔍 <b>Свободно сейчас: {okon(len(current))}</b> — {esc(service_name())}\n{checked}"
         if marked:
             msg += f"\n🆕 — новые с прошлой проверки ({len(marked)})"
         if current:
@@ -477,6 +548,8 @@ def run_once(report_to=None):
         else:
             msg += "\n\nСвободных окон сейчас нет. Как только появятся — сразу напишу."
         send(msg, report_to, CHECK_KEYBOARD)
+    if nearest_to:
+        send(f"{fmt_nearest(current)}\n\n{checked}", nearest_to, NEAREST_KEYBOARD)
     save_state()
     return True
 
@@ -529,7 +602,8 @@ def main():
         return
 
     tg("deleteWebhook")  # с включённым webhook бот не получает нажатия через getUpdates
-    tg("setMyCommands", commands=[{"command": "check", "description": "Свободные окна прямо сейчас"},
+    tg("setMyCommands", commands=[{"command": "nearest", "description": "Ближайшая свободная запись"},
+                                  {"command": "check", "description": "Все свободные окна прямо сейчас"},
                                   {"command": "status", "description": "Работает ли мониторинг"}])
     started = last_save = time.monotonic()
     deadline = started + duration if duration else None
