@@ -1,0 +1,57 @@
+name: Мониторинг записи
+
+# Каждый запуск работает ~5,5 часа: проверяет сайт КАЖДУЮ МИНУТУ и сразу отвечает на кнопки в Telegram.
+# Расписание лишь перезапускает его: пока идёт текущий запуск, следующий ждёт в очереди
+# и стартует сразу после окончания — так проверка идёт без перерывов.
+
+on:
+  schedule:
+    - cron: "*/20 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: reservio-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Берём ветку такой, какая она в момент старта, а не в момент постановки в очередь:
+          # иначе state.json устаревший и приходят повторные уведомления.
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Установка
+        run: |
+          pip install -r requirements.txt
+          git config user.name "monitor-bot"
+          git config user.email "monitor-bot@users.noreply.github.com"
+
+      - name: Проверка свободных окон (каждую минуту, ~5,5 ч)
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          STAFF: ${{ vars.STAFF }}
+          SERVICE_ID: ${{ vars.SERVICE_ID }}
+          INTERVAL_MIN: "1"
+        run: python -u monitor.py --for 330
+
+      - name: Сохранение состояния
+        if: always()
+        run: |
+          [ -f state.json ] || exit 0
+          git add state.json
+          git diff --cached --quiet && exit 0
+          git commit -q -m state
+          git pull -q --rebase -X theirs || git rebase --abort
+          git push -q
