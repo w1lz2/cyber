@@ -282,7 +282,7 @@
  "fails": 0,
  "empty_count": 0,
  "alerted": false,
- "last_ok": "2026-11-02T02:31:31+03:00",
+ "last_ok": "2026-11-02T03:01:31+03:00",
  "tg_offset": 5754486,
  "kb": 2
 }
